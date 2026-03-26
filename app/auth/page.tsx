@@ -10,7 +10,7 @@ import {
   signInWithEmailAndPassword,
 } from "firebase/auth";
 import { auth } from "@/lib/firebase";
-import { saveUserProfile, getUserProfile, UserRole } from "@/lib/firestore";
+import { saveUserProfile, getUserProfile, UserRole, HomeLocation } from "@/lib/firestore";
 import { useAuth } from "@/lib/authContext";
 import ShieldLogo from "@/components/ShieldLogo";
 
@@ -27,6 +27,8 @@ export default function AuthPage() {
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<UserRole>("user");
   const [contacts, setContacts] = useState(""); // comma-separated phone numbers
+  const [homeAddr, setHomeAddr] = useState(""); // home location label (lat/lng captured on signup)
+  const [linkedGuardian, setLinkedGuardian] = useState(""); // guardian UID
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const router = useRouter();
@@ -50,11 +52,27 @@ export default function AuthPage() {
           .split(",")
           .map((c) => c.trim())
           .filter(Boolean);
+
+        // Try to capture current location as home
+        let homeLocation: HomeLocation | undefined;
+        try {
+          const pos = await new Promise<GeolocationPosition>((res, rej) =>
+            navigator.geolocation.getCurrentPosition(res, rej, { timeout: 5000 })
+          );
+          homeLocation = {
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+            label: homeAddr || "Home",
+          };
+        } catch { /* location permission denied — skip */ }
+
         await saveUserProfile({
           uid: cred.user.uid,
           email,
           role,
           emergencyContacts,
+          homeLocation,
+          linkedGuardianUid: linkedGuardian.trim() || undefined,
         });
         router.replace(ROLE_ROUTES[role]);
       } else {
@@ -149,6 +167,32 @@ export default function AuthPage() {
                   className="bg-gray-900 border border-gray-700 text-white rounded-xl px-4 py-3 text-sm focus:border-purple-500 focus:outline-none placeholder-gray-600"
                 />
               </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-gray-400 text-xs px-1">
+                  Home Location Label (optional — GPS captured automatically)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. My Home, Parents House"
+                  value={homeAddr}
+                  onChange={(e) => setHomeAddr(e.target.value)}
+                  className="bg-gray-900 border border-gray-700 text-white rounded-xl px-4 py-3 text-sm focus:border-purple-500 focus:outline-none placeholder-gray-600"
+                />
+              </div>
+              {role === "user" && (
+                <div className="flex flex-col gap-1">
+                  <label className="text-gray-400 text-xs px-1">
+                    Guardian UID (optional — link a guardian account)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Guardian's Firebase UID"
+                    value={linkedGuardian}
+                    onChange={(e) => setLinkedGuardian(e.target.value)}
+                    className="bg-gray-900 border border-gray-700 text-white rounded-xl px-4 py-3 text-sm focus:border-purple-500 focus:outline-none placeholder-gray-600"
+                  />
+                </div>
+              )}
             </>
           )}
 

@@ -1,20 +1,24 @@
 "use client";
 /**
- * SOSButton — core SOS trigger.
- * Features:
- * - Geolocation + Audio recording (non-blocking)
- * - FRONT camera recording with live overlay + stop button
- * - Firebase Firestore alert (with userId)
- * - Firebase Storage upload (audio + video evidence)
- * - Offline SMS fallback
- * - Double-tap screen OR double-press "V" key
- * - "Data sent successfully" popup after upload
- * - Does NOT delay SOS trigger — camera starts in parallel
+ * SOSButton — core SOS trigger (extended, not replaced).
+ *
+ * Flow:
+ * 1. Get location + start audio recording (parallel)
+ * 2. If online  → save alert to Firestore → start camera (non-blocking)
+ * 3. If offline → queue locally → SMS fallback to emergency contacts
+ * 4. After 10s audio → upload audio to Storage
+ * 5. Camera stop → upload video → save to "evidence" collection → share link via SMS
+ * 6. Show "Data sent successfully" popup
+ *
+ * Triggers: button tap | double-tap screen | double-press V key
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getCurrentLocation } from "@/utils/location";
 import { AudioRecorder } from "@/utils/recorder";
-import { saveAlert, updateAlertAudio, updateAlertVideo, getUserProfile } from "@/lib/firestore";
+import {
+  saveAlert, updateAlertAudio, updateAlertVideo,
+  getUserProfile, saveEvidence,
+} from "@/lib/firestore";
 import { uploadAudio } from "@/lib/storage";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase";
@@ -29,26 +33,25 @@ export default function SOSButton({ lang = "en" }: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [showSuccess, setShowSuccess] = useState(false);
-
-  // Camera overlay state
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+
   const videoPreviewRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const cameraChunksRef = useRef<Blob[]>([]);
   const cameraAlertIdRef = useRef<string>("");
-
-  const { user } = useAuth();
   const lastTapRef = useRef<number>(0);
   const lastVPressRef = useRef<number>(0);
 
-  // Cleanup camera on unmount
+  const { user } = useAuth();
+
   useEffect(() => {
-    return () => { cameraStream?.getTracks().forEach((t) => t.stop()); };
+    return () => { cameraStream?.getTracks().forEach((tr) => tr.stop()); };
   }, [cameraStream]);
 
-  // ── Offline SMS fallback ──────────────────────────────────────────────────
-  const sendOfflineSMS = useCallback(async (lat: number, lng: number) => {
+  // ── SMS fallback (offline or error) ──────────────────────────────────────
+  const sendSMSFallback = useCallback(async (lat: number, lng: number, setMsg?: (m: string) => void) => {
+    setMsg?.("No internet. Sending SMS…");
     const contacts: string[] = [];
     if (user) {
       try {
@@ -56,83 +59,119 @@ export default function SOSButton({ lang = "en" }: Props) {
         if (profile?.emergencyContacts?.length) contacts.push(...profile.emergencyContacts);
       } catch { /* ignore */ }
     }
-    const body = encodeURIComponent(
-      `🚨 SOS ALERT from Raksha! I may be in danger. Location: https://maps.google.com/?q=${lat},${lng}`
-    );
-    for (const number of contacts) {
-      window.location.href = `sms:${number}?body=${body}`;
-      await new Promise((r) => setTimeout(r, 800));
+
+    if (!contacts.length) {
+      setMsg?.("No contacts saved. Alert stored locally.");
+      return;
     }
+
+    const body = encodeURIComponent(
+      `🚨 SOS from Raksha! I may be in danger. My location: https://maps.google.com/?q=${lat},${lng}`
+    );
+
+    // Try sending to each contact via sms: URI
+    for (const number of contacts) {
+      try {
+        window.location.href = `sms:${number}?body=${body}`;
+        await new Promise((r) => setTimeout(r, 900));
+      } catch { /* browser may block — user sees pre-filled SMS */ }
+    }
+    setMsg?.("SMS sent to emergency contacts.");
   }, [user]);
 
-  // ── Start front camera recording with overlay ─────────────────────────────
+  // ── Store alert locally for retry ────────────────────────────────────────
+  const queueOfflineAlert = (data: object) => {
+    const queue = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
+    queue.push({ ...data, queuedAt: Date.now() });
+    localStorage.setItem("offlineAlerts", JSON.stringify(queue));
+  };
+
+  // ── Camera: start front-facing recording ─────────────────────────────────
   const startCameraRecording = useCallback(async (alertId: string) => {
     cameraAlertIdRef.current = alertId;
     cameraChunksRef.current = [];
     let stream: MediaStream | null = null;
     try {
-      // Prefer FRONT camera for evidence
       try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" }, audio: false,
-        });
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
       } catch {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       }
       setCameraStream(stream);
       setCameraActive(true);
-
-      // Attach to preview element
       if (videoPreviewRef.current) {
         videoPreviewRef.current.srcObject = stream;
         videoPreviewRef.current.play().catch(() => {});
       }
-
       const mr = new MediaRecorder(stream);
       mediaRecorderRef.current = mr;
       mr.ondataavailable = (e) => { if (e.data.size > 0) cameraChunksRef.current.push(e.data); };
       mr.start(1000);
     } catch (err) {
       console.warn("Camera start failed:", err);
-      stream?.getTracks().forEach((t) => t.stop());
+      stream?.getTracks().forEach((tr) => tr.stop());
     }
   }, []);
 
-  // ── Stop camera + upload ──────────────────────────────────────────────────
+  // ── Camera: stop + upload + save evidence + share via SMS ─────────────────
   const stopCameraRecording = useCallback(async () => {
     const mr = mediaRecorderRef.current;
     if (!mr || mr.state === "inactive") {
       setCameraActive(false);
-      cameraStream?.getTracks().forEach((t) => t.stop());
+      cameraStream?.getTracks().forEach((tr) => tr.stop());
       setCameraStream(null);
       return;
     }
-
     mr.stop();
     await new Promise<void>((resolve) => { mr.onstop = () => resolve(); });
-
-    cameraStream?.getTracks().forEach((t) => t.stop());
+    cameraStream?.getTracks().forEach((tr) => tr.stop());
     setCameraStream(null);
     setCameraActive(false);
 
     const blob = new Blob(cameraChunksRef.current, { type: "video/webm" });
-    if (blob.size < 100) return; // nothing recorded
+    if (blob.size < 100) return;
 
-    // Local download backup
-    const url = URL.createObjectURL(blob);
+    // Local download as backup
+    const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = `raksha_evidence_${Date.now()}.webm`; a.click();
-    URL.revokeObjectURL(url);
+    a.href = blobUrl;
+    a.download = `raksha_evidence_${Date.now()}.webm`;
+    a.click();
+    URL.revokeObjectURL(blobUrl);
 
     // Upload to Firebase Storage
     try {
       const filename = `evidence/${user?.uid ?? "anon"}/sos_${Date.now()}.webm`;
       const storageRef = ref(storage, filename);
       await uploadBytes(storageRef, blob, { contentType: "video/webm" });
-      const videoURL = await getDownloadURL(storageRef);
+      const videoUrl = await getDownloadURL(storageRef);
+
+      // Update alert record
       if (cameraAlertIdRef.current) {
-        await updateAlertVideo(cameraAlertIdRef.current, videoURL);
+        await updateAlertVideo(cameraAlertIdRef.current, videoUrl);
       }
+
+      // Save to "evidence" collection
+      if (user?.uid) {
+        await saveEvidence({
+          userId: user.uid,
+          videoUrl,
+          timestamp: new Date().toISOString(),
+          alertId: cameraAlertIdRef.current || undefined,
+        });
+      }
+
+      // Share video link with emergency contacts via SMS
+      if (user?.uid) {
+        const profile = await getUserProfile(user.uid);
+        const contacts = profile?.emergencyContacts ?? [];
+        const smsBody = encodeURIComponent(`🎥 Raksha evidence video: ${videoUrl}`);
+        for (const number of contacts) {
+          window.location.href = `sms:${number}?body=${smsBody}`;
+          await new Promise((r) => setTimeout(r, 800));
+        }
+      }
+
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 4000);
     } catch (err) {
@@ -151,7 +190,6 @@ export default function SOSButton({ lang = "en" }: Props) {
     let lat = 0, lng = 0;
 
     try {
-      // Location + audio start in parallel — camera starts after alertId is saved
       const [location] = await Promise.all([getCurrentLocation(), recorder.start()]);
       lat = location.latitude;
       lng = location.longitude;
@@ -159,23 +197,33 @@ export default function SOSButton({ lang = "en" }: Props) {
       const alertData = {
         userId: user?.uid ?? "anonymous",
         timestamp: new Date().toISOString(),
-        latitude: lat, longitude: lng,
+        latitude: lat,
+        longitude: lng,
         status: "triggered" as const,
       };
 
-      try {
-        alertId = await saveAlert(alertData);
-        // Start camera AFTER alert is saved — non-blocking, does NOT delay SOS
-        startCameraRecording(alertId).catch(console.warn);
-      } catch {
-        // Firebase offline fallback
-        const offline = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
-        offline.push(alertData);
-        localStorage.setItem("offlineAlerts", JSON.stringify(offline));
+      // ── Online path ───────────────────────────────────────────────────────
+      const isOnline = navigator.onLine;
+      if (isOnline) {
+        try {
+          alertId = await saveAlert(alertData);
+          // Camera starts non-blocking — does NOT delay SOS
+          startCameraRecording(alertId).catch(console.warn);
+        } catch {
+          // Firebase failed even though online — queue + SMS
+          queueOfflineAlert(alertData);
+          setStatus("offline");
+          await recorder.stop();
+          await sendSMSFallback(lat, lng, setMessage);
+          setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
+          return;
+        }
+      } else {
+        // ── Offline path ────────────────────────────────────────────────────
+        queueOfflineAlert(alertData);
         setStatus("offline");
-        setMessage(t(lang, "sosOffline"));
         await recorder.stop();
-        await sendOfflineSMS(lat, lng);
+        await sendSMSFallback(lat, lng, setMessage);
         setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
         return;
       }
@@ -196,12 +244,12 @@ export default function SOSButton({ lang = "en" }: Props) {
       setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
     } catch (err) {
       console.error(err);
-      if (lat && lng) await sendOfflineSMS(lat, lng);
+      if (lat && lng) await sendSMSFallback(lat, lng, setMessage);
       setStatus("error");
       setMessage(t(lang, "sosError"));
       setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
     }
-  }, [status, user, lang, sendOfflineSMS, startCameraRecording]);
+  }, [status, user, lang, sendSMSFallback, startCameraRecording]);
 
   // ── Double-tap ────────────────────────────────────────────────────────────
   const handleScreenTap = useCallback(() => {
@@ -222,13 +270,29 @@ export default function SOSButton({ lang = "en" }: Props) {
     return () => window.removeEventListener("keydown", onKey);
   }, [handleSOS]);
 
+  // Auto-retry queued offline alerts when network returns
+  useEffect(() => {
+    const onOnline = async () => {
+      const queue: object[] = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
+      if (!queue.length) return;
+      try {
+        for (const item of queue) {
+          await saveAlert(item as Parameters<typeof saveAlert>[0]);
+        }
+        localStorage.removeItem("offlineAlerts");
+      } catch { /* will retry next time */ }
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, []);
+
   const colors: Record<Status, string> = {
-    idle:      "bg-gradient-to-br from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 shadow-red-500/60",
-    recording: "bg-orange-500 animate-pulse shadow-orange-500/60",
-    uploading: "bg-yellow-500 animate-pulse shadow-yellow-500/60",
-    done:      "bg-green-500 shadow-green-500/60",
-    error:     "bg-gray-600 shadow-gray-500/60",
-    offline:   "bg-blue-500 shadow-blue-500/60",
+    idle:      "bg-gradient-to-br from-red-600 to-red-700 hover:from-red-500 hover:to-red-600",
+    recording: "bg-orange-500 animate-pulse",
+    uploading: "bg-yellow-500 animate-pulse",
+    done:      "bg-green-500",
+    error:     "bg-gray-600",
+    offline:   "bg-blue-500",
   };
 
   const labels: Record<Status, string> = {
@@ -242,15 +306,10 @@ export default function SOSButton({ lang = "en" }: Props) {
 
   return (
     <div className="flex flex-col items-center gap-4 w-full">
-      {/* ── Camera overlay ── */}
+      {/* Camera overlay */}
       {cameraActive && (
         <div className="w-full bg-black border-2 border-red-500 rounded-2xl overflow-hidden relative">
-          <video
-            ref={videoPreviewRef}
-            muted
-            playsInline
-            className="w-full h-40 object-cover"
-          />
+          <video ref={videoPreviewRef} muted playsInline className="w-full h-40 object-cover" />
           <div className="absolute top-2 left-2 flex items-center gap-1.5 bg-black/70 rounded-full px-3 py-1">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
             <span className="text-white text-xs font-semibold">{t(lang, "recordingEvidence")}</span>
@@ -264,38 +323,42 @@ export default function SOSButton({ lang = "en" }: Props) {
         </div>
       )}
 
-      {/* ── Success popup ── */}
+      {/* Success popup */}
       {showSuccess && (
         <div className="w-full bg-green-900/40 border border-green-500/50 rounded-2xl px-4 py-3 text-center">
           <p className="text-green-300 text-sm font-semibold">{t(lang, "dataSent")}</p>
         </div>
       )}
 
-      {/* ── SOS Button ── */}
+      {/* SOS Button */}
       <button
         onClick={() => { handleScreenTap(); handleSOS(); }}
         onTouchEnd={(e) => { e.preventDefault(); handleScreenTap(); }}
         disabled={status === "recording" || status === "uploading"}
         className={`w-44 h-44 rounded-full text-white font-black text-3xl shadow-2xl transition-all duration-300 border-4 border-white/20 active:scale-95 ${colors[status]}`}
         aria-label="Send SOS Alert"
-        style={{ boxShadow: status === "idle" ? "0 0 40px rgba(239,68,68,0.4), 0 8px 32px rgba(0,0,0,0.5)" : undefined }}
+        style={{
+          boxShadow: status === "idle"
+            ? "0 0 48px rgba(239,68,68,0.5), 0 8px 32px rgba(0,0,0,0.6)"
+            : undefined,
+        }}
       >
         {labels[status]}
       </button>
 
       {message && (
-        <p className={`text-sm font-medium px-4 py-2 rounded-full ${
+        <p className={`text-sm font-medium px-4 py-2 rounded-full text-center max-w-xs ${
           status === "done"    ? "bg-green-900/50 text-green-300" :
           status === "error"   ? "bg-red-900/50 text-red-300" :
           status === "offline" ? "bg-blue-900/50 text-blue-300" :
-          "bg-gray-800 text-gray-300"
+          "bg-gray-800/80 text-gray-300"
         }`}>
           {message}
         </p>
       )}
 
-      <p className="text-gray-600 text-xs text-center max-w-xs">
-        Tap SOS · Double-tap screen · Double-press V
+      <p className="text-gray-600 text-xs text-center">
+        Tap · Double-tap · Double-press V
       </p>
     </div>
   );

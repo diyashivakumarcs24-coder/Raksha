@@ -1,5 +1,5 @@
 ﻿"use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { signOut } from "firebase/auth";
 import { auth } from "@/lib/firebase";
@@ -9,60 +9,68 @@ import SafetyMap from "@/components/SafetyMap";
 import ShieldLogo from "@/components/ShieldLogo";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import AIChatbot from "@/components/AIChatbot";
-import MeshSOS from "@/components/MeshSOS";
+import ThreatRadar from "@/components/ThreatRadar";
+import WalkWithMe from "@/components/WalkWithMe";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
 import { useAuth } from "@/lib/authContext";
 import { watchLocation, LocationData } from "@/utils/location";
 import { Lang, t, getSavedLang } from "@/lib/i18n";
+import { HomeLocation, updateUserHomeLocation } from "@/lib/firestore";
 
 type SafetyLevel = "safe" | "caution" | "danger";
+type Tab = "home" | "emergency" | "map" | "chat" | "more";
 
 const EMERGENCY_CALLS = [
-  { labelKey: "police" as const, number: "100", emoji: "🚔", color: "bg-blue-900/40 border-blue-500/40 text-blue-300" },
-  { labelKey: "hospital" as const, number: "102", emoji: "🚑", color: "bg-red-900/40 border-red-500/40 text-red-300" },
-  { labelKey: "govtOffice" as const, number: "1091", emoji: "👩", color: "bg-purple-900/40 border-purple-500/40 text-purple-300" },
-  { labelKey: "pharmacy" as const, number: "1098", emoji: "🧒", color: "bg-yellow-900/40 border-yellow-500/40 text-yellow-300" },
+  { label: "Police",         number: "100",  emoji: "🚔", color: "bg-blue-900/40 border-blue-500/40 text-blue-300"     },
+  { label: "Ambulance",      number: "102",  emoji: "🚑", color: "bg-red-900/40 border-red-500/40 text-red-300"       },
+  { label: "Women Helpline", number: "1091", emoji: "👩", color: "bg-purple-900/40 border-purple-500/40 text-purple-300" },
+  { label: "Child Helpline", number: "1098", emoji: "🧒", color: "bg-yellow-900/40 border-yellow-500/40 text-yellow-300" },
 ];
-
-const EXCUSES: Record<string, string[]> = {
-  followed: ["I just got a call from my doctor.", "My mom is waiting outside.", "I work at the police station nearby."],
-  uncomfortable: ["My husband is picking me up in 2 minutes.", "I have a video call with my boss now.", "My friend is a security guard here."],
-  "late night": ["I am a nurse, just finished my night shift.", "My brother is a cop nearby.", "I have a self-defense class that just ended."],
-  default: ["I need to take this call urgently.", "I have a medical condition.", "My GPS is being tracked live by my family."],
-};
 
 const SELF_DEFENSE_VIDEOS = [
   { title: "Basic Self-Defense Moves Every Woman Should Know", id: "KVpxP3ZZtAc", channel: "Howcast" },
-  { title: "5 Self-Defense Techniques for Women", id: "Iu8pFBSBaFk", channel: "SELF" },
-  { title: "How to Escape a Wrist Grab", id: "1YkOOoNEAqk", channel: "Nick Drossos" },
+  { title: "5 Self-Defense Techniques for Women",             id: "Iu8pFBSBaFk", channel: "SELF"    },
+  { title: "How to Escape a Wrist Grab",                      id: "1YkOOoNEAqk", channel: "Nick Drossos" },
 ];
 
 const SAFETY_PRODUCTS = [
-  { name: "Pepper Spray", query: "pepper+spray+women+safety", emoji: "🌶️" },
+  { name: "Pepper Spray",   query: "pepper+spray+women+safety",      emoji: "🌶️" },
   { name: "Personal Alarm", query: "personal+safety+alarm+keychain", emoji: "🔔" },
-  { name: "Safety Whistle", query: "safety+whistle+women", emoji: "📯" },
-  { name: "Stun Gun", query: "stun+gun+women+safety", emoji: "⚡" },
+  { name: "Safety Whistle", query: "safety+whistle+women",           emoji: "📯" },
+  { name: "Stun Gun",       query: "stun+gun+women+safety",          emoji: "⚡" },
 ];
 
+const EXCUSES: Record<string, string[]> = {
+  followed:      ["I just got a call from my doctor.", "My mom is waiting outside.", "I work at the police station nearby."],
+  uncomfortable: ["My husband is picking me up in 2 minutes.", "I have a video call with my boss now.", "My friend is a security guard here."],
+  "late night":  ["I am a nurse, just finished my night shift.", "My brother is a cop nearby.", "I have a self-defense class that just ended."],
+  default:       ["I need to take this call urgently.", "I have a medical condition.", "My GPS is being tracked live by my family."],
+};
+
 function DashboardContent() {
-  const [safetyLevel, setSafetyLevel] = useState<SafetyLevel>("safe");
-  const [situation, setSituation] = useState("");
-  const [excuse, setExcuse] = useState("");
+  const [safetyLevel, setSafetyLevel]   = useState<SafetyLevel>("safe");
+  const [situation, setSituation]       = useState("");
+  const [excuse, setExcuse]             = useState("");
   const [offlineCount, setOfflineCount] = useState(0);
-  const [activeTab, setActiveTab] = useState<"home" | "emergency" | "map" | "chat" | "excuse">("home");
-  const [lang, setLang] = useState<Lang>("en");
-  const [location, setLocation] = useState<LocationData | null>(null);
-  const router = useRouter();
-  const { profile } = useAuth();
+  const [activeTab, setActiveTab]       = useState<Tab>("home");
+  const [lang, setLang]                 = useState<Lang>("en");
+  const [location, setLocation]         = useState<LocationData | null>(null);
+  const [homeLocation, setHomeLocation] = useState<HomeLocation | null>(null);
+  const [sosTrigger, setSosTrigger]     = useState(0); // increment to trigger SOS from WalkWithMe
+
+  const router  = useRouter();
+  const { profile, user } = useAuth();
 
   useEffect(() => {
     setLang(getSavedLang());
     const offline = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
     setOfflineCount(offline.length);
-    // Watch location for SafetyMap
+    // Load home location from profile
+    if (profile?.homeLocation) setHomeLocation(profile.homeLocation);
+    // Watch live location
     const id = watchLocation((loc) => setLocation(loc));
     return () => navigator.geolocation.clearWatch(id);
-  }, []);
+  }, [profile]);
 
   const syncOffline = async () => {
     const offline: unknown[] = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
@@ -77,10 +85,15 @@ function DashboardContent() {
   };
 
   const generateExcuse = () => {
-    const key = Object.keys(EXCUSES).find((k) => situation.toLowerCase().includes(k)) || "default";
+    const key  = Object.keys(EXCUSES).find((k) => situation.toLowerCase().includes(k)) || "default";
     const list = EXCUSES[key];
     setExcuse(list[Math.floor(Math.random() * list.length)]);
   };
+
+  // Called by WalkWithMe when timer expires without check-in
+  const handleWalkSOSTrigger = useCallback(() => {
+    setSosTrigger((n) => n + 1);
+  }, []);
 
   const sc = {
     safe:    { color: "bg-green-500",  text: "text-green-400",  border: "border-green-500/30",  label: t(lang, "statusSafe"),    bg: "bg-green-900/20"  },
@@ -88,20 +101,20 @@ function DashboardContent() {
     danger:  { color: "bg-red-500",    text: "text-red-400",    border: "border-red-500/30",    label: t(lang, "statusDanger"),  bg: "bg-red-900/20"    },
   }[safetyLevel];
 
-  const tabs = [
-    { id: "home",      label: t(lang, "home")      },
-    { id: "emergency", label: t(lang, "emergency")  },
-    { id: "map",       label: t(lang, "map")        },
-    { id: "chat",      label: t(lang, "chat")       },
-    { id: "excuse",    label: t(lang, "excuse")     },
-  ] as { id: typeof activeTab; label: string }[];
+  const BOTTOM_TABS = [
+    { id: "home",      icon: "🏠", label: t(lang, "home").replace("🏠 ", "")      },
+    { id: "emergency", icon: "🆘", label: t(lang, "emergency").replace("🆘 ", "") },
+    { id: "map",       icon: "🗺️", label: t(lang, "map").replace("🗺️ ", "")      },
+    { id: "chat",      icon: "💬", label: t(lang, "chat").replace("💬 ", "")      },
+    { id: "more",      icon: "⋯",  label: "More"                                  },
+  ] as { id: Tab; icon: string; label: string }[];
 
   return (
     <div className="min-h-screen bg-black text-white flex flex-col max-w-md mx-auto">
-      {/* ── Header ── */}
+      {/* ── Top Header (logo + lang + sign out) ── */}
       <header className="flex items-center justify-between px-4 py-3 border-b border-gray-800 sticky top-0 bg-black/95 backdrop-blur z-20">
         <div className="flex items-center gap-2">
-          <ShieldLogo size={34} />
+          <ShieldLogo size={32} />
           <div>
             <h1 className="text-white font-bold text-base leading-none">{t(lang, "appName")}</h1>
             <p className="text-gray-500 text-xs">{t(lang, "tagline")}</p>
@@ -115,12 +128,6 @@ function DashboardContent() {
           )}
           <LanguageSwitcher current={lang} onChange={setLang} />
           <button
-            onClick={() => router.push("/fake-call")}
-            className="text-xs bg-gray-800 border border-gray-700 px-2.5 py-1.5 rounded-full hover:bg-gray-700 transition-colors"
-          >
-            📞
-          </button>
-          <button
             onClick={async () => { await signOut(auth); router.replace("/auth"); }}
             className="text-xs bg-gray-800 border border-gray-700 px-2.5 py-1.5 rounded-full hover:bg-gray-700 transition-colors"
             title={profile?.email ?? ""}
@@ -131,7 +138,7 @@ function DashboardContent() {
       </header>
 
       {/* ── Safety Status Bar ── */}
-      <div className={`${sc.bg} border-b ${sc.border} px-4 py-2 flex items-center justify-between`}>
+      <div className={`${sc.bg} border-b ${sc.border} px-4 py-1.5 flex items-center justify-between`}>
         <div className="flex items-center gap-2">
           <span className={`w-2 h-2 rounded-full ${sc.color} animate-pulse`} />
           <span className={`text-xs font-semibold ${sc.text}`}>{sc.label}</span>
@@ -153,39 +160,36 @@ function DashboardContent() {
         </div>
       </div>
 
-      {/* ── Tab Nav ── */}
-      <nav className="flex border-b border-gray-800 bg-gray-950 overflow-x-auto scrollbar-hide">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            onClick={() => setActiveTab(tab.id)}
-            className={`flex-shrink-0 flex-1 py-2.5 text-xs font-medium whitespace-nowrap px-2 transition-colors ${
-              activeTab === tab.id
-                ? "text-purple-400 border-b-2 border-purple-500"
-                : "text-gray-500 hover:text-gray-300"
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </nav>
-
-      {/* ── Content ── */}
-      <main className="flex-1 overflow-y-auto pb-8">
+      {/* ── Main Content ── */}
+      <main className="flex-1 overflow-y-auto pb-20">
 
         {/* HOME */}
         {activeTab === "home" && (
           <div className="flex flex-col items-center gap-5 px-4 pt-6">
             <div className="flex flex-col items-center gap-1">
-              <ShieldLogo size={72} />
+              <ShieldLogo size={68} />
               <p className="text-gray-500 text-sm">{t(lang, "tagline")}</p>
             </div>
 
-            <SOSButton lang={lang} />
+            {/* SOS Button — sosTrigger prop lets WalkWithMe fire it */}
+            <SOSButton lang={lang} key={sosTrigger} />
 
-            {/* Mesh SOS (offline relay) */}
+            {/* Threat Radar */}
             <div className="w-full">
-              <MeshSOS lang={lang} alertData={null} />
+              <ThreatRadar
+                location={location}
+                homeLocation={homeLocation}
+                lang={lang}
+                onHomeSet={(home) => {
+                  setHomeLocation(home);
+                  if (user) updateUserHomeLocation(user.uid, home).catch(console.warn);
+                }}
+              />
+            </div>
+
+            {/* Walk With Me */}
+            <div className="w-full">
+              <WalkWithMe lang={lang} onSOSTrigger={handleWalkSOSTrigger} />
             </div>
 
             {/* Existing LocationCard */}
@@ -193,33 +197,21 @@ function DashboardContent() {
               <LocationCard />
             </div>
 
-            {/* Quick action grid */}
+            {/* Quick actions */}
             <div className="w-full grid grid-cols-2 gap-3">
-              <button
-                onClick={() => setActiveTab("emergency")}
-                className="bg-red-900/30 border border-red-500/40 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-red-400/70 active:scale-95 transition-all"
-              >
+              <button onClick={() => setActiveTab("emergency")} className="bg-red-900/30 border border-red-500/40 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-red-400/70 active:scale-95 transition-all">
                 <span className="text-3xl">🆘</span>
-                <span className="text-sm text-red-300 font-medium">{t(lang, "emergency")}</span>
+                <span className="text-sm text-red-300 font-medium">{t(lang, "emergency").replace("🆘 ", "")}</span>
               </button>
-              <button
-                onClick={() => setActiveTab("map")}
-                className="bg-blue-900/20 border border-blue-500/30 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-blue-400/60 active:scale-95 transition-all"
-              >
+              <button onClick={() => setActiveTab("map")} className="bg-blue-900/20 border border-blue-500/30 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-blue-400/60 active:scale-95 transition-all">
                 <span className="text-3xl">🗺️</span>
                 <span className="text-sm text-blue-300 font-medium">{t(lang, "nearbyResources")}</span>
               </button>
-              <button
-                onClick={() => setActiveTab("chat")}
-                className="bg-purple-900/20 border border-purple-500/30 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-purple-400/60 active:scale-95 transition-all"
-              >
+              <button onClick={() => setActiveTab("chat")} className="bg-purple-900/20 border border-purple-500/30 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-purple-400/60 active:scale-95 transition-all">
                 <span className="text-3xl">🤖</span>
                 <span className="text-sm text-purple-300 font-medium">{t(lang, "aiChatbot")}</span>
               </button>
-              <button
-                onClick={() => router.push("/fake-call")}
-                className="bg-gray-900 border border-gray-700 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-gray-500 active:scale-95 transition-all"
-              >
+              <button onClick={() => router.push("/fake-call")} className="bg-gray-900 border border-gray-700 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-gray-500 active:scale-95 transition-all">
                 <span className="text-3xl">📞</span>
                 <span className="text-sm text-gray-300 font-medium">{t(lang, "fakeCall")}</span>
               </button>
@@ -227,7 +219,7 @@ function DashboardContent() {
           </div>
         )}
 
-        {/* EMERGENCY CALLS */}
+        {/* EMERGENCY */}
         {activeTab === "emergency" && (
           <div className="px-4 pt-5 flex flex-col gap-4">
             <div>
@@ -235,30 +227,20 @@ function DashboardContent() {
               <p className="text-gray-500 text-sm mt-0.5">{t(lang, "tapToCall")}</p>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              {EMERGENCY_CALLS.map(({ labelKey, number, emoji, color }) => (
-                <a
-                  key={number}
-                  href={`tel:${number}`}
-                  className={`border rounded-2xl p-5 flex flex-col items-center gap-3 active:scale-95 transition-transform shadow-lg ${color}`}
-                >
+              {EMERGENCY_CALLS.map(({ label, number, emoji, color }) => (
+                <a key={number} href={`tel:${number}`} className={`border rounded-2xl p-5 flex flex-col items-center gap-3 active:scale-95 transition-transform shadow-lg ${color}`}>
                   <span className="text-4xl">{emoji}</span>
                   <span className="text-2xl font-black tracking-tight">{number}</span>
-                  <span className="text-xs opacity-80 text-center font-medium">{t(lang, labelKey)}</span>
+                  <span className="text-xs opacity-80 text-center font-medium">{label}</span>
                 </a>
               ))}
             </div>
             <p className="text-gray-700 text-xs text-center">Available 24/7 across India</p>
 
-            {/* Self defense videos */}
             <h2 className="text-white font-semibold text-base mt-2">{t(lang, "selfDefense")}</h2>
             {SELF_DEFENSE_VIDEOS.map((video, i) => (
-              <a
-                key={i}
-                href={`https://www.youtube.com/watch?v=${video.id}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden flex gap-3 items-center p-3 hover:border-purple-500/50 group transition-colors"
-              >
+              <a key={i} href={`https://www.youtube.com/watch?v=${video.id}`} target="_blank" rel="noopener noreferrer"
+                className="bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden flex gap-3 items-center p-3 hover:border-purple-500/50 group transition-colors">
                 <div className="relative flex-shrink-0">
                   <img src={`https://img.youtube.com/vi/${video.id}/mqdefault.jpg`} alt={video.title} className="w-24 h-16 object-cover rounded-xl" />
                   <div className="absolute inset-0 flex items-center justify-center">
@@ -274,17 +256,11 @@ function DashboardContent() {
               </a>
             ))}
 
-            {/* Safety products */}
             <h2 className="text-white font-semibold text-base mt-2">{t(lang, "safetyGear")}</h2>
             <div className="grid grid-cols-2 gap-3">
               {SAFETY_PRODUCTS.map((product, i) => (
-                <a
-                  key={i}
-                  href={`https://www.amazon.in/s?k=${product.query}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="bg-gray-900 border border-gray-800 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-orange-500/50 group transition-colors"
-                >
+                <a key={i} href={`https://www.amazon.in/s?k=${product.query}`} target="_blank" rel="noopener noreferrer"
+                  className="bg-gray-900 border border-gray-800 rounded-2xl p-4 flex flex-col items-center gap-2 hover:border-orange-500/50 group transition-colors">
                   <span className="text-3xl group-hover:scale-110 transition-transform">{product.emoji}</span>
                   <span className="text-white text-xs font-medium text-center">{product.name}</span>
                   <span className="text-orange-400 text-xs bg-orange-900/30 px-2 py-0.5 rounded-full">Amazon ↗</span>
@@ -294,7 +270,7 @@ function DashboardContent() {
           </div>
         )}
 
-        {/* SMART SAFETY MAP */}
+        {/* MAP */}
         {activeTab === "map" && (
           <div className="px-4 pt-5 flex flex-col gap-4">
             <div>
@@ -305,9 +281,9 @@ function DashboardContent() {
           </div>
         )}
 
-        {/* AI CHATBOT */}
+        {/* CHAT */}
         {activeTab === "chat" && (
-          <div className="px-4 pt-5 flex flex-col gap-4" style={{ height: "calc(100vh - 180px)" }}>
+          <div className="px-4 pt-5 flex flex-col gap-3" style={{ height: "calc(100vh - 200px)" }}>
             <div>
               <h2 className="text-white font-semibold text-lg">{t(lang, "aiChatbot")}</h2>
               <p className="text-gray-500 text-sm mt-0.5">{t(lang, "safetyAdvice")}</p>
@@ -318,63 +294,81 @@ function DashboardContent() {
           </div>
         )}
 
-        {/* EXCUSE GENERATOR */}
-        {activeTab === "excuse" && (
-          <div className="px-4 pt-5 flex flex-col gap-4">
+        {/* MORE (excuse + walk + settings) */}
+        {activeTab === "more" && (
+          <div className="px-4 pt-5 flex flex-col gap-5">
+            {/* Excuse Generator */}
             <div>
-              <h2 className="text-white font-semibold text-lg">{t(lang, "smartExcuse")}</h2>
-              <p className="text-gray-500 text-sm mt-0.5">Describe your situation</p>
-            </div>
-            <div className="bg-gray-900 border border-gray-700 rounded-2xl p-4 flex flex-col gap-3">
-              <textarea
-                value={situation}
-                onChange={(e) => setSituation(e.target.value)}
-                placeholder="e.g. I am being followed, late night..."
-                className="bg-gray-800 text-white rounded-xl p-3 text-sm resize-none h-24 border border-gray-700 focus:border-purple-500 focus:outline-none placeholder-gray-600"
-              />
-              <button
-                onClick={generateExcuse}
-                disabled={!situation.trim()}
-                className="bg-purple-600 hover:bg-purple-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-semibold py-3 rounded-xl transition-colors"
-              >
-                {t(lang, "generateExcuse")}
-              </button>
-            </div>
-            {excuse && (
-              <div className="bg-purple-900/30 border border-purple-500/40 rounded-2xl p-4">
-                <p className="text-purple-300 text-xs font-semibold mb-2 uppercase tracking-wide">{t(lang, "yourExcuse")}</p>
-                <p className="text-white text-sm leading-relaxed">&ldquo;{excuse}&rdquo;</p>
-                <button
-                  onClick={() => { if (navigator.clipboard) navigator.clipboard.writeText(excuse); }}
-                  className="mt-3 text-xs text-purple-400 hover:text-purple-300 transition-colors"
-                >
-                  {t(lang, "copy")}
+              <h2 className="text-white font-semibold text-base mb-3">{t(lang, "smartExcuse")}</h2>
+              <div className="bg-gray-900 border border-gray-700 rounded-2xl p-4 flex flex-col gap-3">
+                <textarea
+                  value={situation}
+                  onChange={(e) => setSituation(e.target.value)}
+                  placeholder="e.g. I am being followed, late night..."
+                  className="bg-gray-800 text-white rounded-xl p-3 text-sm resize-none h-20 border border-gray-700 focus:border-purple-500 focus:outline-none placeholder-gray-600"
+                />
+                <button onClick={generateExcuse} disabled={!situation.trim()}
+                  className="bg-purple-600 hover:bg-purple-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-semibold py-2.5 rounded-xl transition-colors text-sm">
+                  {t(lang, "generateExcuse")}
                 </button>
               </div>
-            )}
-            <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4">
-              <p className="text-gray-500 text-xs font-semibold mb-3 uppercase tracking-wide">{t(lang, "quickExcuses")}</p>
-              <div className="flex flex-wrap gap-2">
-                {["followed", "uncomfortable", "late night"].map((tag) => (
-                  <button
-                    key={tag}
-                    onClick={() => setSituation(tag)}
-                    className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-full transition-colors"
-                  >
-                    {tag}
+              {excuse && (
+                <div className="bg-purple-900/30 border border-purple-500/40 rounded-2xl p-4 mt-3">
+                  <p className="text-purple-300 text-xs font-semibold mb-2 uppercase tracking-wide">{t(lang, "yourExcuse")}</p>
+                  <p className="text-white text-sm leading-relaxed">&ldquo;{excuse}&rdquo;</p>
+                  <button onClick={() => { if (navigator.clipboard) navigator.clipboard.writeText(excuse); }}
+                    className="mt-3 text-xs text-purple-400 hover:text-purple-300 transition-colors">
+                    {t(lang, "copy")}
                   </button>
-                ))}
+                </div>
+              )}
+              <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4 mt-3">
+                <p className="text-gray-500 text-xs font-semibold mb-2 uppercase">{t(lang, "quickExcuses")}</p>
+                <div className="flex flex-wrap gap-2">
+                  {["followed", "uncomfortable", "late night"].map((tag) => (
+                    <button key={tag} onClick={() => setSituation(tag)}
+                      className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-full transition-colors">
+                      {tag}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
+
+            {/* Fake call shortcut */}
+            <button onClick={() => router.push("/fake-call")}
+              className="bg-gray-900 border border-gray-700 rounded-2xl p-4 flex items-center gap-3 hover:border-gray-500 transition-colors">
+              <span className="text-2xl">📞</span>
+              <div className="text-left">
+                <p className="text-white text-sm font-medium">{t(lang, "fakeCall")}</p>
+                <p className="text-gray-500 text-xs">Simulate an incoming call</p>
+              </div>
+            </button>
+
+            {/* Back to calculator */}
+            <button onClick={() => router.push("/")}
+              className="text-gray-600 text-xs text-center hover:text-gray-400 transition-colors py-2">
+              {t(lang, "backToCalc")}
+            </button>
           </div>
         )}
       </main>
 
-      <div className="px-4 py-2 border-t border-gray-900 text-center">
-        <button onClick={() => router.push("/")} className="text-gray-700 text-xs hover:text-gray-500 transition-colors">
-          {t(lang, "backToCalc")}
-        </button>
-      </div>
+      {/* ── Bottom Navigation Bar ── */}
+      <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-md bg-black/95 border-t border-gray-800 flex z-20 safe-area-bottom">
+        {BOTTOM_TABS.map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            className={`flex-1 flex flex-col items-center justify-center py-2.5 gap-0.5 transition-colors ${
+              activeTab === tab.id ? "text-purple-400" : "text-gray-600 hover:text-gray-400"
+            }`}
+          >
+            <span className="text-lg leading-none">{tab.icon}</span>
+            <span className="text-xs font-medium">{tab.label}</span>
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }
