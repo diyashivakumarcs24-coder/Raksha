@@ -1,13 +1,15 @@
 "use client";
 /**
- * SOSButton — core SOS trigger with:
- * - Geolocation capture
- * - Audio recording (MediaRecorder)
- * - Camera recording (environment/front fallback)
- * - Firebase Firestore alert save (with userId)
- * - Firebase Storage upload (audio + video)
- * - Offline SMS fallback via window.location.href
- * - Double-tap (screen) OR double-press "V" key trigger
+ * SOSButton — core SOS trigger.
+ * Features:
+ * - Geolocation + Audio recording (non-blocking)
+ * - FRONT camera recording with live overlay + stop button
+ * - Firebase Firestore alert (with userId)
+ * - Firebase Storage upload (audio + video evidence)
+ * - Offline SMS fallback
+ * - Double-tap screen OR double-press "V" key
+ * - "Data sent successfully" popup after upload
+ * - Does NOT delay SOS trigger — camera starts in parallel
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getCurrentLocation } from "@/utils/location";
@@ -17,105 +19,139 @@ import { uploadAudio } from "@/lib/storage";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase";
 import { useAuth } from "@/lib/authContext";
+import { Lang, t } from "@/lib/i18n";
 
 type Status = "idle" | "recording" | "uploading" | "done" | "error" | "offline";
 
-export default function SOSButton() {
+interface Props { lang?: Lang }
+
+export default function SOSButton({ lang = "en" }: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
-  const { user } = useAuth();
+  const [showSuccess, setShowSuccess] = useState(false);
 
-  // Double-tap / double-V detection refs
+  // Camera overlay state
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const videoPreviewRef = useRef<HTMLVideoElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const cameraChunksRef = useRef<Blob[]>([]);
+  const cameraAlertIdRef = useRef<string>("");
+
+  const { user } = useAuth();
   const lastTapRef = useRef<number>(0);
   const lastVPressRef = useRef<number>(0);
 
-  // ── Offline SMS fallback ──────────────────────────────────────────────────
-  const sendOfflineSMS = useCallback(
-    async (lat: number, lng: number) => {
-      const contacts: string[] = [];
-      if (user) {
-        try {
-          const profile = await getUserProfile(user.uid);
-          if (profile?.emergencyContacts?.length) {
-            contacts.push(...profile.emergencyContacts);
-          }
-        } catch {
-          // ignore — use empty list
-        }
-      }
-      const body = encodeURIComponent(
-        `🚨 SOS ALERT from Raksha! I may be in danger. Location: https://maps.google.com/?q=${lat},${lng}`
-      );
-      // Trigger SMS for each contact sequentially
-      for (const number of contacts) {
-        window.location.href = `sms:${number}?body=${body}`;
-        await new Promise((r) => setTimeout(r, 800));
-      }
-    },
-    [user]
-  );
+  // Cleanup camera on unmount
+  useEffect(() => {
+    return () => { cameraStream?.getTracks().forEach((t) => t.stop()); };
+  }, [cameraStream]);
 
-  // ── Camera recording ──────────────────────────────────────────────────────
-  const recordCamera = async (
-    alertId: string,
-    lat: number,
-    lng: number
-  ): Promise<void> => {
+  // ── Offline SMS fallback ──────────────────────────────────────────────────
+  const sendOfflineSMS = useCallback(async (lat: number, lng: number) => {
+    const contacts: string[] = [];
+    if (user) {
+      try {
+        const profile = await getUserProfile(user.uid);
+        if (profile?.emergencyContacts?.length) contacts.push(...profile.emergencyContacts);
+      } catch { /* ignore */ }
+    }
+    const body = encodeURIComponent(
+      `🚨 SOS ALERT from Raksha! I may be in danger. Location: https://maps.google.com/?q=${lat},${lng}`
+    );
+    for (const number of contacts) {
+      window.location.href = `sms:${number}?body=${body}`;
+      await new Promise((r) => setTimeout(r, 800));
+    }
+  }, [user]);
+
+  // ── Start front camera recording with overlay ─────────────────────────────
+  const startCameraRecording = useCallback(async (alertId: string) => {
+    cameraAlertIdRef.current = alertId;
+    cameraChunksRef.current = [];
     let stream: MediaStream | null = null;
     try {
-      // Prefer back camera, fallback to front
+      // Prefer FRONT camera for evidence
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
-          audio: false,
+          video: { facingMode: "user" }, audio: false,
         });
       } catch {
         stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
       }
+      setCameraStream(stream);
+      setCameraActive(true);
 
-      const chunks: Blob[] = [];
+      // Attach to preview element
+      if (videoPreviewRef.current) {
+        videoPreviewRef.current.srcObject = stream;
+        videoPreviewRef.current.play().catch(() => {});
+      }
+
       const mr = new MediaRecorder(stream);
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => { if (e.data.size > 0) cameraChunksRef.current.push(e.data); };
       mr.start(1000);
-      await new Promise((r) => setTimeout(r, 10000)); // record 10s
-      mr.stop();
-      await new Promise<void>((resolve) => { mr.onstop = () => resolve(); });
+    } catch (err) {
+      console.warn("Camera start failed:", err);
+      stream?.getTracks().forEach((t) => t.stop());
+    }
+  }, []);
 
-      stream.getTracks().forEach((t) => t.stop());
+  // ── Stop camera + upload ──────────────────────────────────────────────────
+  const stopCameraRecording = useCallback(async () => {
+    const mr = mediaRecorderRef.current;
+    if (!mr || mr.state === "inactive") {
+      setCameraActive(false);
+      cameraStream?.getTracks().forEach((t) => t.stop());
+      setCameraStream(null);
+      return;
+    }
 
-      const blob = new Blob(chunks, { type: "video/webm" });
+    mr.stop();
+    await new Promise<void>((resolve) => { mr.onstop = () => resolve(); });
+
+    cameraStream?.getTracks().forEach((t) => t.stop());
+    setCameraStream(null);
+    setCameraActive(false);
+
+    const blob = new Blob(cameraChunksRef.current, { type: "video/webm" });
+    if (blob.size < 100) return; // nothing recorded
+
+    // Local download backup
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `raksha_evidence_${Date.now()}.webm`; a.click();
+    URL.revokeObjectURL(url);
+
+    // Upload to Firebase Storage
+    try {
       const filename = `evidence/${user?.uid ?? "anon"}/sos_${Date.now()}.webm`;
       const storageRef = ref(storage, filename);
       await uploadBytes(storageRef, blob, { contentType: "video/webm" });
       const videoURL = await getDownloadURL(storageRef);
-      await updateAlertVideo(alertId, videoURL);
-
-      // Also offer local download as backup
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `raksha_evidence_${Date.now()}.webm`;
-      a.click();
-      URL.revokeObjectURL(url);
+      if (cameraAlertIdRef.current) {
+        await updateAlertVideo(cameraAlertIdRef.current, videoURL);
+      }
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 4000);
     } catch (err) {
-      console.warn("Camera recording failed:", err);
-      if (stream) stream.getTracks().forEach((t) => t.stop());
+      console.warn("Video upload failed:", err);
     }
-  };
+  }, [cameraStream, user]);
 
   // ── Core SOS handler ─────────────────────────────────────────────────────
   const handleSOS = useCallback(async () => {
     if (status === "recording" || status === "uploading") return;
     setStatus("recording");
-    setMessage("Recording & locating…");
+    setMessage(t(lang, "sosRecording"));
 
     const recorder = new AudioRecorder();
     let alertId = "";
-    let lat = 0;
-    let lng = 0;
+    let lat = 0, lng = 0;
 
     try {
+      // Location + audio start in parallel — camera starts after alertId is saved
       const [location] = await Promise.all([getCurrentLocation(), recorder.start()]);
       lat = location.latitude;
       lng = location.longitude;
@@ -123,76 +159,63 @@ export default function SOSButton() {
       const alertData = {
         userId: user?.uid ?? "anonymous",
         timestamp: new Date().toISOString(),
-        latitude: lat,
-        longitude: lng,
+        latitude: lat, longitude: lng,
         status: "triggered" as const,
       };
 
-      // ── Try Firebase ──────────────────────────────────────────────────────
       try {
         alertId = await saveAlert(alertData);
+        // Start camera AFTER alert is saved — non-blocking, does NOT delay SOS
+        startCameraRecording(alertId).catch(console.warn);
       } catch {
-        // Firebase failed → offline fallback
+        // Firebase offline fallback
         const offline = JSON.parse(localStorage.getItem("offlineAlerts") || "[]");
         offline.push(alertData);
         localStorage.setItem("offlineAlerts", JSON.stringify(offline));
         setStatus("offline");
-        setMessage("Offline — sending SMS…");
+        setMessage(t(lang, "sosOffline"));
         await recorder.stop();
         await sendOfflineSMS(lat, lng);
-        setMessage("SMS sent. Alert saved locally.");
         setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
         return;
       }
 
-      // ── Record 10s audio ─────────────────────────────────────────────────
+      // Record 10s audio
       await new Promise((r) => setTimeout(r, 10000));
       setStatus("uploading");
-      setMessage("Uploading evidence…");
+      setMessage(t(lang, "sosSending"));
 
       const blob = await recorder.stop();
-      const filename = `sos_${Date.now()}.webm`;
-
       try {
-        const audioURL = await uploadAudio(blob, filename);
+        const audioURL = await uploadAudio(blob, `sos_${Date.now()}.webm`);
         await updateAlertAudio(alertId, audioURL);
-      } catch {
-        // Audio upload failed — alert still saved, continue
-      }
-
-      // ── Camera recording (non-blocking) ──────────────────────────────────
-      recordCamera(alertId, lat, lng).catch(console.warn);
+      } catch { /* audio upload failed — alert still saved */ }
 
       setStatus("done");
-      setMessage("🚨 SOS Alert Sent!");
+      setMessage(t(lang, "sosSent"));
       setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
     } catch (err) {
       console.error(err);
-      // Last resort — try SMS even on unexpected error
       if (lat && lng) await sendOfflineSMS(lat, lng);
       setStatus("error");
-      setMessage("Error — check location/mic permissions.");
+      setMessage(t(lang, "sosError"));
       setTimeout(() => { setStatus("idle"); setMessage(""); }, 5000);
     }
-  }, [status, user, sendOfflineSMS]);
+  }, [status, user, lang, sendOfflineSMS, startCameraRecording]);
 
-  // ── Double-tap on screen ──────────────────────────────────────────────────
+  // ── Double-tap ────────────────────────────────────────────────────────────
   const handleScreenTap = useCallback(() => {
     const now = Date.now();
-    if (now - lastTapRef.current < 500) {
-      handleSOS();
-    }
+    if (now - lastTapRef.current < 500) handleSOS();
     lastTapRef.current = now;
   }, [handleSOS]);
 
-  // ── Double-press "V" key ──────────────────────────────────────────────────
+  // ── Double-V key ──────────────────────────────────────────────────────────
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() !== "v") return;
       const now = Date.now();
-      if (now - lastVPressRef.current < 500) {
-        handleSOS();
-      }
+      if (now - lastVPressRef.current < 500) handleSOS();
       lastVPressRef.current = now;
     };
     window.addEventListener("keydown", onKey);
@@ -200,53 +223,79 @@ export default function SOSButton() {
   }, [handleSOS]);
 
   const colors: Record<Status, string> = {
-    idle: "bg-red-600 hover:bg-red-500 shadow-red-500/50",
-    recording: "bg-orange-500 animate-pulse shadow-orange-500/50",
-    uploading: "bg-yellow-500 animate-pulse shadow-yellow-500/50",
-    done: "bg-green-500 shadow-green-500/50",
-    error: "bg-gray-600 shadow-gray-500/50",
-    offline: "bg-blue-500 shadow-blue-500/50",
+    idle:      "bg-gradient-to-br from-red-600 to-red-700 hover:from-red-500 hover:to-red-600 shadow-red-500/60",
+    recording: "bg-orange-500 animate-pulse shadow-orange-500/60",
+    uploading: "bg-yellow-500 animate-pulse shadow-yellow-500/60",
+    done:      "bg-green-500 shadow-green-500/60",
+    error:     "bg-gray-600 shadow-gray-500/60",
+    offline:   "bg-blue-500 shadow-blue-500/60",
   };
 
   const labels: Record<Status, string> = {
-    idle: "SOS",
-    recording: "REC…",
-    uploading: "SEND…",
-    done: "SENT ✓",
-    error: "ERROR",
-    offline: "SMS…",
+    idle:      t(lang, "sosButton"),
+    recording: t(lang, "sosRecording"),
+    uploading: t(lang, "sosSending"),
+    done:      t(lang, "sosSent"),
+    error:     t(lang, "sosError"),
+    offline:   t(lang, "sosOffline"),
   };
 
   return (
-    <div className="flex flex-col items-center gap-4">
+    <div className="flex flex-col items-center gap-4 w-full">
+      {/* ── Camera overlay ── */}
+      {cameraActive && (
+        <div className="w-full bg-black border-2 border-red-500 rounded-2xl overflow-hidden relative">
+          <video
+            ref={videoPreviewRef}
+            muted
+            playsInline
+            className="w-full h-40 object-cover"
+          />
+          <div className="absolute top-2 left-2 flex items-center gap-1.5 bg-black/70 rounded-full px-3 py-1">
+            <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+            <span className="text-white text-xs font-semibold">{t(lang, "recordingEvidence")}</span>
+          </div>
+          <button
+            onClick={stopCameraRecording}
+            className="absolute bottom-2 right-2 bg-red-600 hover:bg-red-500 text-white text-xs font-semibold px-3 py-1.5 rounded-full transition-colors"
+          >
+            {t(lang, "stopRecording")}
+          </button>
+        </div>
+      )}
+
+      {/* ── Success popup ── */}
+      {showSuccess && (
+        <div className="w-full bg-green-900/40 border border-green-500/50 rounded-2xl px-4 py-3 text-center">
+          <p className="text-green-300 text-sm font-semibold">{t(lang, "dataSent")}</p>
+        </div>
+      )}
+
+      {/* ── SOS Button ── */}
       <button
         onClick={() => { handleScreenTap(); handleSOS(); }}
-        onTouchEnd={handleScreenTap}
+        onTouchEnd={(e) => { e.preventDefault(); handleScreenTap(); }}
         disabled={status === "recording" || status === "uploading"}
-        className={`w-40 h-40 rounded-full text-white font-black text-3xl shadow-2xl transition-all duration-300 border-4 border-white/20 ${colors[status]}`}
+        className={`w-44 h-44 rounded-full text-white font-black text-3xl shadow-2xl transition-all duration-300 border-4 border-white/20 active:scale-95 ${colors[status]}`}
         aria-label="Send SOS Alert"
+        style={{ boxShadow: status === "idle" ? "0 0 40px rgba(239,68,68,0.4), 0 8px 32px rgba(0,0,0,0.5)" : undefined }}
       >
         {labels[status]}
       </button>
 
       {message && (
-        <p
-          className={`text-sm font-medium px-4 py-2 rounded-full ${
-            status === "done"
-              ? "bg-green-900/50 text-green-300"
-              : status === "error"
-              ? "bg-red-900/50 text-red-300"
-              : status === "offline"
-              ? "bg-blue-900/50 text-blue-300"
-              : "bg-gray-800 text-gray-300"
-          }`}
-        >
+        <p className={`text-sm font-medium px-4 py-2 rounded-full ${
+          status === "done"    ? "bg-green-900/50 text-green-300" :
+          status === "error"   ? "bg-red-900/50 text-red-300" :
+          status === "offline" ? "bg-blue-900/50 text-blue-300" :
+          "bg-gray-800 text-gray-300"
+        }`}>
           {message}
         </p>
       )}
 
-      <p className="text-gray-500 text-xs text-center max-w-xs">
-        Tap SOS · Double-tap screen · Double-press V key
+      <p className="text-gray-600 text-xs text-center max-w-xs">
+        Tap SOS · Double-tap screen · Double-press V
       </p>
     </div>
   );
