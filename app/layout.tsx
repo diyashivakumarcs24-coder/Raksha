@@ -1,9 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import { AuthProvider } from "@/lib/authContext";
 
 export const metadata: Metadata = {
-  title: "ShadowwSOS — Women's Safety App",
-  description: "Your silent guardian. Stay safe with ShadowwSOS.",
+  title: "Raksha — Women's Safety App",
+  description: "Your silent guardian. Stay safe with Raksha.",
   manifest: "/manifest.json",
 };
 
@@ -17,7 +18,9 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className="bg-black text-white antialiased">{children}</body>
+      <body className="bg-black text-white antialiased">
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }

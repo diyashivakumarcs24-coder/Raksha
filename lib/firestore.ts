@@ -1,11 +1,25 @@
-import { collection, addDoc, getDocs, updateDoc, doc, query, orderBy } from "firebase/firestore";
+import {
+  collection,
+  addDoc,
+  getDocs,
+  updateDoc,
+  doc,
+  query,
+  orderBy,
+  setDoc,
+  getDoc,
+} from "firebase/firestore";
 import { db } from "./firebase";
 
+// ─── Alert ────────────────────────────────────────────────────────────────────
+
 export interface AlertData {
+  userId?: string;
   timestamp: string;
   latitude: number;
   longitude: number;
   audioURL?: string;
+  videoURL?: string;
   status: "triggered";
 }
 
@@ -28,6 +42,15 @@ export async function updateAlertAudio(id: string, audioURL: string): Promise<vo
   }
 }
 
+export async function updateAlertVideo(id: string, videoURL: string): Promise<void> {
+  try {
+    await updateDoc(doc(db, "alerts", id), { videoURL });
+  } catch (error) {
+    console.error("Error updating alert video:", error);
+    throw error;
+  }
+}
+
 export async function getAlerts(): Promise<(AlertData & { id: string })[]> {
   try {
     const q = query(collection(db, "alerts"), orderBy("timestamp", "desc"));
@@ -36,5 +59,38 @@ export async function getAlerts(): Promise<(AlertData & { id: string })[]> {
   } catch (error) {
     console.error("Error fetching alerts:", error);
     return [];
+  }
+}
+
+// ─── User Profile ─────────────────────────────────────────────────────────────
+
+export type UserRole = "user" | "guardian" | "police" | "admin";
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  role: UserRole;
+  emergencyContacts: string[]; // array of phone numbers
+}
+
+/** Create or overwrite a user profile in Firestore */
+export async function saveUserProfile(profile: UserProfile): Promise<void> {
+  try {
+    await setDoc(doc(db, "users", profile.uid), profile);
+  } catch (error) {
+    console.error("Error saving user profile:", error);
+    throw error;
+  }
+}
+
+/** Fetch a user profile by uid */
+export async function getUserProfile(uid: string): Promise<UserProfile | null> {
+  try {
+    const snap = await getDoc(doc(db, "users", uid));
+    if (!snap.exists()) return null;
+    return snap.data() as UserProfile;
+  } catch (error) {
+    console.error("Error fetching user profile:", error);
+    return null;
   }
 }
